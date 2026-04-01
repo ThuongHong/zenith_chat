@@ -1,0 +1,99 @@
+@startuml
+left to right direction
+
+' --- GLOBAL STYLE ---
+skinparam backgroundColor #F8F9FA
+skinparam defaultTextAlignment center
+skinparam roundcorner 15
+skinparam arrowThickness 2
+skinparam arrowColor #444444
+skinparam linetype ortho
+
+skinparam nodesep 50
+skinparam ranksep 100
+
+skinparam ArrowFontSize 12
+skinparam ArrowFontColor #222222
+
+skinparam component {
+    BackgroundColor #FFFFFF
+    BorderColor #1976D2
+    BorderThickness 2
+}
+skinparam database {
+    BackgroundColor #E8F5E9
+    BorderColor #2E7D32
+    BorderThickness 2
+}
+skinparam cloud {
+    BackgroundColor #F3E5F5
+    BorderColor #8E24AA
+    BorderThickness 2
+}
+skinparam node {
+    BackgroundColor #FFF3E0
+    BorderColor #E65100
+    BorderThickness 2
+}
+
+actor "Khách hàng" as User #DDDDDD
+
+package "1. Channels" {
+    component "FB / IG / Lazada" as Channels
+}
+
+package "2. Fastify API" {
+    component "Channel Adapter" as Adapter
+    database "Redis Buffer" as RedisBuffer
+    component "Aggregator\n(3-5s)" as Aggregator
+
+    Adapter -[hidden]down- RedisBuffer
+    RedisBuffer -[hidden]down- Aggregator
+}
+
+package "3. AI Agent Engine" {
+    component "Tools" as Tools
+    component "Agent Loop\n(ReAct)" as ReAct
+    cloud "Gemini API" as Gemini
+
+    Tools -[hidden]down- ReAct
+    ReAct -[hidden]down- Gemini
+}
+
+package "4. Supabase" {
+    database "Postgres\n(messages, orders)" as DB
+    component "Realtime" as Realtime
+
+    DB -[hidden]down- Realtime
+}
+
+package "5. Consumers" {
+    node "Worker\n(Follow-up)" as Worker
+    node "Dashboard\n(Flutter)" as Dashboard
+
+    Worker -[hidden]down- Dashboard
+}
+
+' ===== FLOW =====
+User --> Channels : (1)\nSend
+Channels --> Adapter : (2)\nWebhook
+
+Adapter --> RedisBuffer : (3)\nBuffer
+RedisBuffer --> Aggregator : (4)\nBatch
+Aggregator --> ReAct : (5)\nContext
+
+ReAct <--> Gemini : (6)\nLLM
+ReAct --> Tools : (7)\nTools
+Tools --> DB : Query\nUpdate
+
+ReAct --> DB : (8)\nSave
+DB --> Realtime
+Realtime --> Dashboard : Live\nupdate
+
+ReAct --> Adapter : (9a)\nReply
+Worker --> Adapter : (9b)\nDelayed
+
+Adapter --> Channels : (10)\nSend
+Channels --> User : (11)\nResponse
+
+@enduml
