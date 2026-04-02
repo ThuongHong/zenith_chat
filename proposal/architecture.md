@@ -2,48 +2,45 @@
 
 ## 1. System Overview
 
-Zenith Chat là một **Omnichannel AI Agent** xử lý tin nhắn từ nhiều nền tảng (Facebook, Instagram, Lazada) thông qua một AI Engine thống nhất, kết hợp với dashboard thời gian thực cho agent người dùng.
+Zenith Chat là một **Omnichannel AI Agent** xử lý tin nhắn từ nhiều nền tảng (Facebook, Instagram, TikTok Shop, Shopee,...) thông qua một AI Engine thống nhất, kết hợp với dashboard thời gian thực cho agent người dùng.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        INPUT CHANNELS                           │
-│   📱 FB Messenger     📸 Instagram DM     🛒 Lazada (Mock)      │
-└─────────────┬───────────────┬───────────────┬───────────────────┘
-              │               │               │
-              └───────────────┴───────────────┘
-                              │ POST /webhook/:channelId
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      FASTIFY API LAYER                          │
-│  ┌─────────────────┐   ┌──────────────────┐                    │
-│  │ Channel Adapter │──▶│ Message Aggregator│ (Redis 3-5s)       │
-│  │ (Normalize msg) │   │ (Debounce buffer) │                    │
-│  └─────────────────┘   └────────┬─────────┘                    │
-└───────────────────────────────── │ ───────────────────────────--┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    ⭐ AI AGENT ENGINE                            │
-│                   (Gemini Flash / Pro)                  │
-│                                                                 │
-│   PERCEIVE ──▶ REASON ──▶ ACT ──▶ OBSERVE ──▶ RESPOND          │
-│                                                                 │
-│   Tools: search_product · check_inventory · apply_voucher       │
-│          get_order_status · escalate_to_human                   │
-│          schedule_followup · switch_to_cs_mode                  │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       SUPABASE LAYER                            │
-│  PostgreSQL (persistent) ──▶ Realtime Publisher                 │
-│  tables: customers · conversations · messages · orders          │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-        ┌────────────┴────────────┐
-        ▼                         ▼
- Flutter Web Dashboard      BullMQ Worker (Redis)
- (Agent Inbox + Realtime)   (Delayed follow-up jobs)
+┌──────────────────────────────────────────────────────────────────────┐
+│                          INPUT CHANNELS                              │
+│  📱 FB Messenger  📸 Instagram  🎵 TikTok Shop          ...         │
+└──────────┬──────────────┬──────────────┬──────────────┬─────────────┘
+           └──────────────┴──────────────┴──────────────┘
+                          │ POST /webhook/:channelId
+                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        FASTIFY API LAYER                             │
+│  Channel Adapter (normalize) ──▶ SA/CA Tagger ──▶ Message Aggregator│
+│                                  (tag hội thoại)   (Redis 3-5s)     │
+└────────────────────────────────────┬─────────────────────────────────┘
+                                     │
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                  ⭐ AI AGENT ENGINE (Hybrid Model)                    │
+│           Gemini 2.0 Flash (95%) · Gemini 2.5 Pro (5%)              │
+│                                                                      │
+│   PERCEIVE ──▶ REASON ──▶ ACT ──▶ OBSERVE ──▶ RESPOND               │
+│                                                                      │
+│   SA Tools: match_product_image · search_product · check_inventory   │
+│             search_similar · apply_voucher · collect_customer_info   │
+│             confirm_order · create_qr_payment                        │
+│   CS Tools: schedule_followup · escalate_to_human                    │
+│   Ops Tools: notify_staff · create_shipping_order                    │
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │
+         ┌─────────────┼──────────────┬──────────────────┐
+         ▼             ▼              ▼                  ▼
+  Supabase        BullMQ Worker  Telegram Bot       External APIs
+  (PostgreSQL      (Follow-up     (Staff notify)    (VietQR · Momo
+  + Realtime)      + Expiry)                         · Ahamove
+         │                                            · SePay/Casso)
+         ▼
+ Flutter Web Dashboard
+ (Agent Inbox + Tags + Realtime)
 ```
 
 ---
@@ -62,15 +59,16 @@ Lazada Mock   ──┘
 
 ```typescript
 interface NormalizedMessage {
-  channelId:  'facebook' | 'instagram' | 'lazada'
+  channelId:  'facebook' | 'instagram' | 'tiktok' | 'shopee'
   customerId: string      // platform-specific ID đã được map
   content:    string      // text đã gộp
+  imageUrls?: string[]    // [NEW] ảnh sản phẩm khách gửi
   timestamp:  Date
   metadata:   object      // attachments, product context...
 }
 ```
 
-> **Lợi ích:** Thêm kênh mới (Zalo, Shopee) chỉ cần thêm 1 adapter, không đụng vào AI hay DB.
+> **Lợi ích:** Thêm kênh mới (Zalo, Lazada...) chỉ cần thêm 1 adapter, không đụng vào AI hay DB.
 
 ---
 
@@ -129,14 +127,23 @@ Cơ chế: **Debounce với sliding window**, key = `buffer:{conversationId}`.
                     └─────────────────────────────┘
 ```
 
-**Ví dụ multi-step tool chaining:**
+**Ví dụ 1 — Text query:**
 ```
 Khách: "còn áo đen size M không, tôi muốn đặt luôn"
 
 → [ACT 1]  search_product("áo đen")         → product_id: "P001"
 → [ACT 2]  check_inventory("P001", "size M") → stock: 5
-→ [ACT 3]  apply_voucher(customer, 10%)      → AI tự quyết kích cầu vì intent mua rõ
-→ [RESPOND] "Dạ còn 5 cái ạ! Em hỗ trợ thêm 10% còn 315k, freeship đơn từ 300k 😊"
+→ [ACT 3]  apply_voucher(customer, 10%)      → AI tự quyết kích cầu
+→ [RESPOND] "Dạ còn 5 cái ạ! Em hỗ trợ thêm 10% còn 315k nha 😊"
+```
+
+**Ví dụ 2 — Image query (mới):**
+```
+Khách: [gửi ảnh sản phẩm] + "mẫu này còn không"
+
+→ [ACT 1]  match_product_image(imageUrl)     → product_id: "P042"
+→ [ACT 2]  check_inventory("P042", null)     → stock: 3
+→ [RESPOND] "Dạ còn 3 cái ạ! Mẫu này đang có size M và L nè 😊"
 ```
 
 ---
@@ -303,17 +310,23 @@ Mọi tin nhắn
 ## 7. Full Stack Summary
 
 ```
-┌─────────────────────────────────────────────────┐
-│              ZENITH CHAT — STACK                │
-├─────────────────┬───────────────────────────────┤
-│ AI Engine       │ Gemini 2.0 Flash + 2.5 Pro    │
-│ Backend         │ Node.js + Fastify + TypeScript │
-│ Database        │ Supabase (PostgreSQL)          │
-│ Realtime        │ Supabase Realtime              │
-│ Auth            │ Supabase Auth                  │
-│ Queue           │ BullMQ + Redis                 │
-│ Frontend        │ Flutter Web                    │
-│ Channels        │ FB + Instagram + Lazada        │
-│ Pattern         │ Adapter + Agent Loop           │
-└─────────────────┴───────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                  ZENITH CHAT — STACK                    │
+├──────────────────────┬──────────────────────────────────┤
+│ AI Engine            │ Gemini 2.0 Flash + 2.5 Pro       │
+│ Backend              │ Node.js + Fastify + TypeScript    │
+│ Database             │ Supabase (PostgreSQL)             │
+│ Realtime             │ Supabase Realtime                 │
+│ Auth                 │ Supabase Auth                     │
+│ Queue                │ BullMQ + Redis                    │
+│ Frontend             │ Flutter Web                       │
+│ Channels             │ FB · Instagram · TikTok · Shopee  │
+│ Payment              │ VietQR · Momo                     │
+│ Bank Webhook         │ SePay / Casso (idempotency check) │
+│ Ops Notification     │ Telegram Bot / Zalo OA            │
+│ Shipping             │ Ahamove · Viettel Post            │
+│ E-invoice            │ VNPT / Viettel                    │
+│ Log                  │ Google Sheets                     │
+│ Pattern              │ Adapter + Agent Loop + SA/CA Tag  │
+└──────────────────────┴──────────────────────────────────┘
 ```
